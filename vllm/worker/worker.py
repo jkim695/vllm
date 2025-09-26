@@ -122,10 +122,14 @@ class Worker(LocalOrDistributedWorkerBase):
             raise RuntimeError("Profiler is not enabled.")
         self.profiler.stop()
 
-    def sleep(self, level: int = 1) -> None:
+    def sleep(self, model_tag: str, level: int = 1) -> None:
+        
+        tags_to_sleep = (f"{model_tag}_weights", f"{model_tag}_kv_cache")
+        offload_tags = tags_to_sleep if level == 1 else tuple()
+        
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
         allocator = CuMemAllocator.get_instance()
-        allocator.sleep(offload_tags=("weights", ) if level == 1 else tuple())
+        allocator.sleep(offload_tags=offload_tags)
         free_bytes_after_sleep, total = torch.cuda.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         used_bytes = total - free_bytes_after_sleep
@@ -134,10 +138,11 @@ class Worker(LocalOrDistributedWorkerBase):
             "Sleep mode freed %.2f GiB memory, "
             "%.2f GiB memory is still in use.", freed_bytes / GiB_bytes,
             used_bytes / GiB_bytes)
+        
 
-    def wake_up(self, tags: Optional[list[str]] = None) -> None:
+    def wake_up(self, model_tag: str) -> None:
         allocator = CuMemAllocator.get_instance()
-        allocator.wake_up(tags=tags)
+        allocator.wake_up(tags=[f"{model_tag}_weights", f"{model_tag}_kv_cache"])
 
     def init_device(self) -> None:
         if self.device_config.device.type == "cuda":
@@ -169,13 +174,11 @@ class Worker(LocalOrDistributedWorkerBase):
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
-    def load_model(self):
+    def load_model(self, model_tag: str):
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CuMemAllocator.get_instance()
-            assert allocator.get_current_usage() == 0, (
-                "Sleep mode can only be "
-                "used for one instance per process.")
-            context = allocator.use_memory_pool(tag="weights")
+            # The key change: Use the model_tag to create a unique tag
+            context = allocator.use_memory_pool(tag=f"{model_tag}_weights")
         else:
             from contextlib import nullcontext
             context = nullcontext()
@@ -283,7 +286,7 @@ class Worker(LocalOrDistributedWorkerBase):
             "not properly cleaned up before initializing the vLLM instance.")
 
     def initialize_cache(self, num_gpu_blocks: int,
-                         num_cpu_blocks: int) -> None:
+                         num_cpu_blocks: int, model_tag: str) -> None:
         """Allocate GPU and CPU KV cache with the specified number of blocks.
 
         This also warms up the model, which may record CUDA graphs.
@@ -296,16 +299,18 @@ class Worker(LocalOrDistributedWorkerBase):
 
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
-
+        
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CuMemAllocator.get_instance()
-            context = allocator.use_memory_pool(tag="kv_cache")
+            # The key change: Use the model_tag to create a unique tag
+            context = allocator.use_memory_pool(tag=f"{model_tag}_kv_cache")
         else:
             from contextlib import nullcontext
             context = nullcontext()
         with context:
             self._init_cache_engine()
         self._warm_up_model()
+        
 
     def _init_cache_engine(self):
         assert self.cache_config.num_gpu_blocks is not None

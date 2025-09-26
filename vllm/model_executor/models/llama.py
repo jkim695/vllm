@@ -98,7 +98,7 @@ class LlamaMLP(nn.Module):
 class LlamaAttention(nn.Module):
 
     def __init__(self,
-                 config: LlamaConfig,
+                 vllm_config: "VllmConfig",
                  hidden_size: int,
                  num_heads: int,
                  num_kv_heads: int,
@@ -111,6 +111,8 @@ class LlamaAttention(nn.Module):
                  cache_config: Optional[CacheConfig] = None,
                  prefix: str = "") -> None:
         super().__init__()
+        config = vllm_config.model_config.hf_config
+
         layer_idx = extract_layer_index(prefix)
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
@@ -161,7 +163,7 @@ class LlamaAttention(nn.Module):
         is_gguf = quant_config and quant_config.get_name() == "gguf"
         if is_gguf and config.model_type == "llama":
             is_neox_style = False
-
+        model_id =  vllm_config.instance_id
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.rotary_dim,
@@ -169,6 +171,7 @@ class LlamaAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=is_neox_style,
+            model_id=model_id
         )
 
         if hasattr(config, "interleaved_sliding_window"):
@@ -212,12 +215,13 @@ class LlamaDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: LlamaConfig,
+        vllm_config: "VllmConfig",
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
+        config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -237,7 +241,7 @@ class LlamaDecoderLayer(nn.Module):
             attention_bias = config.qkv_bias
 
         self.self_attn = LlamaAttention(
-            config=config,
+            vllm_config=vllm_config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=getattr(config, "num_key_value_heads",
@@ -292,7 +296,7 @@ class LlamaModel(nn.Module):
 
     def __init__(self,
                  *,
-                 vllm_config: VllmConfig,
+                 vllm_config: "VllmConfig",
                  prefix: str = "",
                  layer_type: Type[LlamaDecoderLayer] = LlamaDecoderLayer):
         super().__init__()
@@ -320,10 +324,10 @@ class LlamaModel(nn.Module):
             self.embed_tokens = PPMissingLayer()
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: layer_type(config=config,
-                                      cache_config=cache_config,
-                                      quant_config=quant_config,
-                                      prefix=prefix),
+            lambda prefix: layer_type(vllm_config=vllm_config, # <-- Pass the whole config
+                                    cache_config=cache_config,
+                                    quant_config=quant_config,
+                                    prefix=prefix),
             prefix=f"{prefix}.layers",
         )
         if get_pp_group().is_last_rank:

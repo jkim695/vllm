@@ -1933,17 +1933,45 @@ class LLMEngine:
     def stop_profile(self) -> None:
         self.model_executor.stop_profile()
 
-    def sleep(self, level: int = 1) -> None:
-        assert self.vllm_config.model_config.enable_sleep_mode, (
-            "Sleep mode is not enabled in the model config")
-        self.model_executor.sleep(level=level)
+    # In your LLMEngine class
 
-    def wake_up(self, tags: Optional[list[str]] = None) -> None:
+    def sleep(self, level: int = 1, model_tag: Optional[str] = None) -> None:
+        """
+        Puts the engine to sleep by commanding its executor.
+        It prioritizes the passed-in model_tag.
+        """
         assert self.vllm_config.model_config.enable_sleep_mode, (
             "Sleep mode is not enabled in the model config")
-        self.model_executor.wake_up(tags)
+
+        # Prioritize the tag passed from the LLM object, but fall back to the
+        # engine's own configured tag if one isn't provided.
+        tag_to_sleep = model_tag or self.model_config.model_tag
+        if not tag_to_sleep:
+            raise ValueError(
+                "Cannot sleep engine without a model_tag.")
+
+        # Pass the correct tag down to the executor.
+        self.model_executor.sleep(level=level, model_tag=tag_to_sleep)
+
+    def wake_up(self, model_tag: Optional[str] = None) -> None:
+        """
+        Wakes the engine from sleep by commanding its executor.
+        It prioritizes the passed-in model_tag.
+        """
+        assert self.vllm_config.model_config.enable_sleep_mode, (
+            "Sleep mode is not enabled in the model config")
+
+        # Prioritize the tag passed from the LLM object.
+        tag_to_wake = model_tag or self.model_config.model_tag
+        if not tag_to_wake:
+            raise ValueError(
+                "Cannot wake up engine without a model_tag.")
+
+        # Pass the correct tag down to the executor.
+        self.model_executor.wake_up(model_tag=tag_to_wake)
 
     def is_sleeping(self) -> bool:
+        """Checks if the executor is currently in a sleeping state."""
         return self.model_executor.is_sleeping
 
     def check_health(self) -> None:

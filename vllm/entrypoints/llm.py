@@ -159,6 +159,7 @@ class LLM:
     def __init__(
         self,
         model: str,
+        model_tag: Optional[str] = None, # <-- added model_tag parameter
         tokenizer: Optional[str] = None,
         tokenizer_mode: str = "auto",
         skip_tokenizer_init: bool = False,
@@ -213,6 +214,7 @@ class LLM:
 
         engine_args = EngineArgs(
             model=model,
+            model_tag=model_tag,  # <-- pass model_tag to EngineArgs
             task=task,
             tokenizer=tokenizer,
             tokenizer_mode=tokenizer_mode,
@@ -1214,7 +1216,13 @@ class LLM:
                 weights are not needed. It reduces CPU memory pressure.
         """
         self.reset_prefix_cache()
-        self.llm_engine.sleep(level=level)
+        # Retrieve the unique model tag from the engine's configuration.
+        model_tag = self.llm_engine.model_config.model_tag
+        if not model_tag:
+            raise ValueError("model_tag is not configured for this LLM instance.")
+
+        # Pass the model_tag down to the engine's sleep method.
+        self.llm_engine.sleep(level=level, model_tag=model_tag)
 
     def wake_up(self, tags: Optional[list[str]] = None):
         """
@@ -1229,6 +1237,12 @@ class LLM:
                 engine is used again.
         """
         self.llm_engine.wake_up(tags)
+        model_tag = self.llm_engine.model_config.model_tag
+        if not model_tag:
+            raise ValueError("model_tag is not configured for this LLM instance.")
+
+        # Call the engine's wake_up method with the model_tag.
+        self.llm_engine.wake_up(model_tag=model_tag)
 
     # LEGACY
     def _convert_v1_inputs(

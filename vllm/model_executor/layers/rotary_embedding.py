@@ -1157,6 +1157,7 @@ def get_rope(
     rope_scaling: Optional[Dict[str, Any]] = None,
     dtype: Optional[torch.dtype] = None,
     partial_rotary_factor: float = 1.0,
+    model_id: Optional[Any] = None,
 ) -> RotaryEmbedding:
     if dtype is None:
         dtype = torch.get_default_dtype()
@@ -1171,8 +1172,10 @@ def get_rope(
         rope_scaling_args = None
     if partial_rotary_factor < 1.0:
         rotary_dim = int(rotary_dim * partial_rotary_factor)
+        
+    # pass model_id to so this system initializes different RoPE caches for different models
     key = (head_size, rotary_dim, max_position, base, is_neox_style,
-           rope_scaling_args, dtype)
+           rope_scaling_args, dtype, model_id)
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
 

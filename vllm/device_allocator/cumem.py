@@ -16,7 +16,9 @@ from typing import Any, Callable, Dict, Optional, Tuple, Union
 import torch
 
 from vllm.utils import is_pin_memory_available
+from vllm.logger import init_logger
 
+logger = init_logger(__name__)
 
 def find_loaded_library(lib_name) -> Optional[str]:
     """
@@ -101,7 +103,6 @@ def use_memory_pool_with_allocator(
     with torch.cuda.memory.use_mem_pool(mem_pool):
         yield mem_pool, new_alloc
 
-
 class CuMemAllocator:
     """
     A singleton class that manages a memory pool for CUDA tensors.
@@ -149,8 +150,12 @@ class CuMemAllocator:
             "for the latest updates.")
 
         self.pointer_to_data: Dict[int, AllocationData] = {}
+        self.sleeping_pointer_to_data: Dict[int, AllocationData] = {}
         self.current_tag: str = CuMemAllocator.default_tag
         self.allocator_and_pools: Dict[str, Any] = {}
+        # Track pointers that have been freed during sleep to prevent double-free
+        self._freed_pointers: set = set()
+        self._is_sleeping: bool = False
 
     def python_malloc_callback(self, allocation_handle: HandleType) -> None:
         """
@@ -159,77 +164,174 @@ class CuMemAllocator:
         py_d_mem = allocation_handle[2]
         self.pointer_to_data[py_d_mem] = AllocationData(
             allocation_handle, self.current_tag)
+        logger.debug(f"Allocated {allocation_handle[1]} bytes for tag {self.current_tag} at ptr {py_d_mem}")
         return
 
     def python_free_callback(self, ptr: int) -> HandleType:
         """
         Internal method to look up the allocation data
         when memory is freed in the memory pool."""
-        data = self.pointer_to_data.pop(ptr)
+        
+        # If we're sleeping and this pointer was already freed, return a dummy handle
+        if self._is_sleeping and ptr in self._freed_pointers:
+            logger.debug(f"Skipping already freed pointer {ptr} during sleep mode")
+            # Return a dummy handle to prevent crash
+            return (0, 0, ptr, 0)
+        
+        # Check if pointer exists in our registry
+        data = self.pointer_to_data.pop(ptr, None)
+        if data is None:
+            # This can happen if the pointer was already freed during sleep
+            # or if there's a mismatch in the allocator state
+            logger.warning(f"Pointer {ptr} not found in allocation registry")
+            # Return a dummy handle to prevent crash
+            return (0, 0, ptr, 0)
+        
+        # Clean up CPU backup if it exists
         if data.cpu_backup_tensor is not None:
             data.cpu_backup_tensor = None
+        
+        logger.debug(
+            "Freed %s bytes for %s with address %s from cumem allocator",
+            data.handle[1], data.tag, ptr)
         return data.handle
 
     def sleep(
-            self,
-            offload_tags: Optional[Union[Tuple[str, ...],
-                                         str]] = None) -> None:
+        self,
+        offload_tags: Optional[Union[tuple[str, ...], str]] = None
+        ) -> None:
         """
-        Put the allocator in sleep mode.
-        All data in the memory allocation with the specified tag will be
-        offloaded to CPU memory, and others will be discarded.
+        Puts allocations with specific tags to sleep by offloading them to CPU.
+        Other active allocations are left untouched.
 
-        :param offload_tags: The tags of the memory allocation that will be
-            offloaded. The rest of the memory allocation will be discarded.
+        :param offload_tags: The tags of the memory allocations that will be
+            offloaded.
         """
+        logger.info(f"Starting sleep with offload_tags: {offload_tags}")
+        # Your debug logging of the allocator state is very helpful, keep it.
+        # logger.info(f"Current allocator state before sleep:")
+        # logger.info(f" - Total tracked pointers: {len(self.pointer_to_data)}")
+        # for i, (ptr, data) in enumerate(list(self.pointer_to_data.items())):
+        #     logger.info(f"   {i+1}. Ptr: {ptr}, Tag: {data.tag}, Size: {data.handle[1]}")
+
+        self._is_sleeping = True
+        self._freed_pointers.clear()
+
         if offload_tags is None:
-            # by default, allocated tensors are offloaded
-            # when the allocator sleeps
-            offload_tags = (CuMemAllocator.default_tag, )
+            offload_tags = (CuMemAllocator.default_tag,)
         elif isinstance(offload_tags, str):
-            offload_tags = (offload_tags, )
-
+            offload_tags = (offload_tags,)
         assert isinstance(offload_tags, tuple)
 
-        for ptr, data in self.pointer_to_data.items():
-            handle = data.handle
-            if data.tag in offload_tags:
-                size_in_bytes = handle[1]
-                cpu_backup_tensor = torch.empty(
-                    size_in_bytes,
-                    dtype=torch.uint8,
-                    device='cpu',
-                    pin_memory=is_pin_memory_available())
-                cpu_ptr = cpu_backup_tensor.data_ptr()
-                libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
-                data.cpu_backup_tensor = cpu_backup_tensor
-            unmap_and_release(handle)
+        total_bytes = 0
+        backup_bytes = 0
 
+        # Only select pointers that match the specific tags we want to put to sleep.
+        # Do not touch any other pointers in the active registry.
+        pointers_to_offload = {
+            ptr: data for ptr, data in self.pointer_to_data.items()
+            if data.tag in offload_tags
+        }
+
+        items_to_process = list(pointers_to_offload.items())
+        logger.info(f"Found {len(items_to_process)} allocations to offload.")
+
+        # Loop ONLY over the selected pointers for the target model.
+        for ptr, data in items_to_process:
+            # 1. Remove the pointer from the active registry.
+            self.pointer_to_data.pop(ptr)
+            
+            handle = data.handle
+            total_bytes += handle[1]
+            backup_bytes += handle[1]
+            
+            # 2. Offload to CPU.
+            size_in_bytes = handle[1]
+            cpu_backup_tensor = torch.empty(
+                size_in_bytes,
+                dtype=torch.uint8,
+                device='cpu',
+                pin_memory=is_pin_memory_available())
+            cpu_ptr = cpu_backup_tensor.data_ptr()
+            libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
+            data.cpu_backup_tensor = cpu_backup_tensor
+            
+            # 3. Add to the sleeping registry.
+            self.sleeping_pointer_to_data[ptr] = data
+            
+            # 4. Unmap from GPU. This is the first and only time for this ptr.
+            unmap_and_release(handle)
+            # don't need this, memory operations are targeted now
+            # self._freed_pointers.add(ptr)
+
+        logger.info(
+            "CuMemAllocator: sleep freed %.2f GiB memory for the specified tags. "
+            "All %.2f GiB is backed up in CPU.",
+            total_bytes / 1024**3, backup_bytes / 1024**3
+        )
+
+        self._is_sleeping = False
+        
+        # 400ms bottleneck for 3.5 gb model
+        # Simple test runs fine without this
         gc.collect()
+      
         torch.cuda.empty_cache()
 
     def wake_up(self, tags: Optional[list[str]] = None) -> None:
         """
         Wake up the allocator from sleep mode.
-        All data that is previously offloaded will be loaded back to GPU 
+        All data that is previously offloaded will be loaded back to GPU
         memory, and the rest of the data will have empty memory.
-        
+
         :param tags: The tags of the memory allocation that will be loaded
             back to GPU memory. If None, all memory allocation will be loaded
             back to GPU memory.
         """
-        for ptr, data in self.pointer_to_data.items():
+        logger.info(f"Starting wake_up with tags: {tags}")
+        
+        restored_count = 0
+        restored_bytes = 0
+        
+        # Iterate over a copy of the sleeping pointers
+        items_to_restore = list(self.sleeping_pointer_to_data.items())
+
+        for ptr, data in items_to_restore:
+            # we only restore the pointers for one specific model
+            # if tags is None might not be necessary because tags should be always set
             if tags is None or data.tag in tags:
+                # First, remove the pointer from the sleeping registry.
+                self.sleeping_pointer_to_data.pop(ptr)
+                
                 handle = data.handle
+                logger.debug(f"Restoring ptr {ptr} with tag {data.tag}")
+                
+                # Re-map the GPU memory.
                 create_and_map(handle)
+                
+                # If there's a CPU backup, copy it to the newly mapped GPU memory.
                 if data.cpu_backup_tensor is not None:
                     cpu_backup_tensor = data.cpu_backup_tensor
-                    if cpu_backup_tensor is not None:
-                        size_in_bytes = cpu_backup_tensor.numel(
-                        ) * cpu_backup_tensor.element_size()
-                        cpu_ptr = cpu_backup_tensor.data_ptr()
-                        libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
-                        data.cpu_backup_tensor = None
+                    size_in_bytes = cpu_backup_tensor.numel(
+                    ) * cpu_backup_tensor.element_size()
+                    cpu_ptr = cpu_backup_tensor.data_ptr()
+                    libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
+                    data.cpu_backup_tensor = None  # Free the CPU backup
+                    restored_count += 1
+                    restored_bytes += size_in_bytes
+                    logger.debug(f"Restored {size_in_bytes} bytes for ptr {ptr}")
+
+                # Add the now-awake pointer back to the ACTIVE registry.
+                self.pointer_to_data[ptr] = data
+
+        # Clear the freed pointers set and exit sleep mode.
+        # This should probably only happen when the wake-up is for a specific purpose
+        # and not globally. We can leave it for now.
+        # self._freed_pointers.clear()
+        self._is_sleeping = False
+        
+        logger.info(f"Wake up complete: restored {restored_count} allocations, "
+                    f"{restored_bytes / 1024**3:.2f} GiB")
 
     @contextmanager
     def use_memory_pool(self, tag: Optional[str] = None):
@@ -248,6 +350,8 @@ class CuMemAllocator:
 
         old_tag = self.current_tag
         self.current_tag = tag
+        logger.debug(f"Using memory pool with tag: {tag}")
+        
         with use_memory_pool_with_allocator(self.python_malloc_callback,
                                             self.python_free_callback) as data:
             # start to hit another PyTorch bug in PyTorch 2.6,
@@ -267,8 +371,15 @@ class CuMemAllocator:
             # allocate memory.
             # TODO: we need to find a way to release the memory,
             # i.e. calling torch.cuda.empty_cache()
+            allocations = data[0].snapshot()
+            for allocation in allocations:
+                if allocation["allocated_size"] == 0:
+                    # Only free if we're not in sleep mode and pointer wasn't already freed
+                    if not self._is_sleeping and allocation["address"] not in self._freed_pointers:
+                        handle = self.python_free_callback(allocation["address"])
+                        if handle != (0, 0, allocation["address"], 0):  # Not a dummy handle
+                            unmap_and_release(handle)
             self.current_tag = old_tag
-
     def get_current_usage(self) -> int:
         """
         Get the total number of bytes allocated in the memory pool.

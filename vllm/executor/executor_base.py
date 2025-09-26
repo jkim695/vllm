@@ -119,9 +119,15 @@ class ExecutorBase(ABC):
 
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
-
+        model_tag = self.model_config.model_tag
+        if not model_tag:
+            raise ValueError(
+                "model_tag is not set in ModelConfig, which is required for "
+                "cache initialization.")
+        
+        # initialize kv_cache with model_tag
         self.collective_rpc("initialize_cache",
-                            args=(num_gpu_blocks, num_cpu_blocks))
+                        args=(num_gpu_blocks, num_cpu_blocks, model_tag))
 
     def apply_model(self, func: Callable[[nn.Module], _R]) -> list[_R]:
         """
@@ -198,41 +204,57 @@ class ExecutorBase(ABC):
     def stop_profile(self) -> None:
         self.collective_rpc("stop_profile")
 
-    def sleep(self, level: int = 1):
+    # Inside the ExecutorBase class
+
+    def sleep(self, level: int = 1, model_tag: Optional[str] = None):
         if self.is_sleeping:
             logger.warning("Executor is already sleeping.")
             return
-        time_before_sleep = time.perf_counter()
-        self.collective_rpc("sleep", kwargs=dict(level=level))
-        time_after_sleep = time.perf_counter()
-        self.sleeping_tags = {"weights", "kv_cache"}
-        self.is_sleeping = True
-        logger.info("It took %.6f seconds to fall asleep.",
-                    time_after_sleep - time_before_sleep)
 
-    def wake_up(self, tags: Optional[list[str]] = None):
+        # Retrieve the unique tag for this model instance from the config.
+        model_tag = self.model_config.model_tag
+        if not model_tag:
+            raise ValueError(
+                "model_tag is not set in ModelConfig, which is required for "
+                "model-specific sleep operations.")
+
+        time_before_sleep = time.perf_counter()
+
+        # Pass both level and model_tag to the worker's sleep method.
+        self.collective_rpc("sleep", kwargs=dict(level=level, model_tag=model_tag))
+        
+        time_after_sleep = time.perf_counter()
+        self.is_sleeping = True
+        logger.info("It took %.6f seconds for model '%s' to fall asleep.",
+                    time_after_sleep - time_before_sleep, model_tag)
+
+    # Inside the ExecutorBase class
+
+    def wake_up(self, model_tag: Optional[str] = None):
         if not self.is_sleeping:
             logger.warning("Executor is not sleeping.")
             return
-        if tags:
-            for tag in tags:
-                if tag not in self.sleeping_tags:
-                    logger.warning("Tag %s is not in sleeping tags %s", tag,
-                                   self.sleeping_tags)
-                    return
+
+        # Retrieve the unique tag for this model instance from the config.
+        model_tag = self.model_config.model_tag
+        if not model_tag:
+            raise ValueError(
+                "model_tag is not set in ModelConfig, which is required for "
+                "model-specific wake_up operations.")
+
         time_before_wakeup = time.perf_counter()
-        self.collective_rpc("wake_up", kwargs=dict(tags=tags))
+
+        # The worker's wake_up method now identifies the model by its unique tag.
+        self.collective_rpc("wake_up", kwargs=dict(model_tag=model_tag))
+        
         time_after_wakeup = time.perf_counter()
-        logger.info("It took %.6f seconds to wake up tags %s.",
+        logger.info("It took %.6f seconds to wake up model '%s'.",
                     time_after_wakeup - time_before_wakeup,
-                    tags if tags is not None else self.sleeping_tags)
-        if tags:
-            for tag in tags:
-                self.sleeping_tags.remove(tag)
-        else:
-            self.sleeping_tags.clear()
-        if not self.sleeping_tags:
-            self.is_sleeping = False
+                    model_tag)
+        
+        # This executor is now fully awake.
+        # The old `sleeping_tags` logic is no longer needed.
+        self.is_sleeping = False
 
     def save_sharded_state(
         self,

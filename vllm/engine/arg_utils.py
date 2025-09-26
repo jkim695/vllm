@@ -91,7 +91,9 @@ def nullable_kvs(val: str) -> Optional[Mapping[str, int]]:
 @dataclass
 class EngineArgs:
     """Arguments for vLLM engine."""
-    model: str = 'facebook/opt-125m'
+    model: str = 'facebook/opt-125m',
+    model_tag: Optional[str] = None
+
     served_model_name: Optional[Union[str, List[str]]] = None
     tokenizer: Optional[str] = None
     hf_config_path: Optional[str] = None
@@ -1027,6 +1029,7 @@ class EngineArgs:
             model=self.model,
             hf_config_path=self.hf_config_path,
             task=self.task,
+            model_tag=self.model_tag,
             # We know this is not None because we set it in __post_init__
             tokenizer=cast(str, self.tokenizer),
             tokenizer_mode=self.tokenizer_mode,
