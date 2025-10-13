@@ -266,8 +266,11 @@ class ModelConfig:
         enable_sleep_mode: bool = False,
         override_generation_config: Optional[dict[str, Any]] = None,
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
+        model_tag: Optional[str] = None,
+
     ) -> None:
         self.model = maybe_model_redirect(model)
+        self.model_tag = model_tag
         self.tokenizer = maybe_model_redirect(tokenizer)
 
         self.hf_config_path = hf_config_path
