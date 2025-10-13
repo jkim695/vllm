@@ -24,7 +24,7 @@ class UniProcExecutor(ExecutorBase):
         """Initialize the worker and load the model.
         """
         self.driver_worker = WorkerWrapperBase(vllm_config=self.vllm_config,
-                                               rpc_rank=0)
+                                            rpc_rank=0)
         distributed_init_method = get_distributed_init_method(
             get_ip(), get_open_port())
         local_rank = 0
@@ -44,7 +44,18 @@ class UniProcExecutor(ExecutorBase):
         )
         self.collective_rpc("init_worker", args=([kwargs], ))
         self.collective_rpc("init_device")
-        self.collective_rpc("load_model")
+
+        # --- START of CHANGES ---
+        # Retrieve the unique model tag from the executor's own configuration.
+        model_tag = self.model_config.model_tag
+        if not model_tag:
+            raise ValueError(
+                "model_tag is not set in ModelConfig, which is required for "
+                "model loading.")
+
+        # Pass the model_tag as a positional argument in the RPC call.
+        self.collective_rpc("load_model", args=(model_tag, ))
+        # --- END of CHANGES ---
 
     def collective_rpc(self,
                        method: Union[str, Callable],
