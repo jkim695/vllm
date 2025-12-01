@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# PATCHED: Added thread-local support for multiple concurrent engines
 
+import threading
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -42,15 +44,26 @@ class ForwardContext:
     dp_metadata: Optional[DPMetadata] = None
 
 
-_forward_context: Optional[ForwardContext] = None
+# PATCHED: Use thread-local storage instead of global variable
+# This allows multiple engines to run concurrently without context conflicts
+_thread_local = threading.local()
+
+
+def _get_forward_context_storage():
+    """Get thread-local forward context storage."""
+    if not hasattr(_thread_local, 'forward_context'):
+        _thread_local.forward_context = None
+    return _thread_local
 
 
 def get_forward_context() -> ForwardContext:
     """Get the current forward context."""
-    assert _forward_context is not None, (
+    # PATCHED: Use thread-local storage
+    ctx = _get_forward_context_storage().forward_context
+    assert ctx is not None, (
         "Forward context is not set. "
         "Please use `set_forward_context` to set the forward context.")
-    return _forward_context
+    return ctx
 
 
 @contextmanager
@@ -90,9 +103,10 @@ def set_forward_context(attn_metadata: Any,
         cu_tokens_across_dp_cpu = torch.cumsum(num_tokens_tensor, dim=0)
         dp_metadata = DPMetadata(cu_tokens_across_dp_cpu)
 
-    global _forward_context
-    prev_context = _forward_context
-    _forward_context = ForwardContext(
+    # PATCHED: Use thread-local storage instead of global
+    storage = _get_forward_context_storage()
+    prev_context = storage.forward_context
+    storage.forward_context = ForwardContext(
         no_compile_layers=vllm_config.compilation_config.
         static_forward_context,
         virtual_engine=virtual_engine,
@@ -133,4 +147,5 @@ def set_forward_context(attn_metadata: Any,
                     logger.info(("Batchsize forward time stats "
                                  "(batchsize, count, median_time(ms)): %s"),
                                 forward_stats)
-        _forward_context = prev_context
+        # PATCHED: Use thread-local storage
+        storage.forward_context = prev_context
