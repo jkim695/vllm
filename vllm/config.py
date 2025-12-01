@@ -3753,7 +3753,19 @@ class VllmConfig:
             f"compilation_config={self.compilation_config!r}")
 
 
-_current_vllm_config: Optional[VllmConfig] = None
+# Thread-local storage for vLLM config to support multi-engine async scenarios
+import threading
+_vllm_config_local = threading.local()
+
+
+def _get_current_vllm_config_attr() -> Optional[VllmConfig]:
+    """Get the thread-local vLLM config attribute."""
+    return getattr(_vllm_config_local, 'config', None)
+
+
+def _set_current_vllm_config_attr(config: Optional[VllmConfig]) -> None:
+    """Set the thread-local vLLM config attribute."""
+    _vllm_config_local.config = config
 
 
 @contextmanager
@@ -3761,16 +3773,18 @@ def set_current_vllm_config(vllm_config: VllmConfig, check_compile=False):
     """
     Temporarily set the current vLLM config.
     Used during model initialization.
-    We save the current vLLM config in a global variable,
+    We save the current vLLM config in a thread-local variable,
     so that all modules can access it, e.g. custom ops
     can access the vLLM config to determine how to dispatch.
+    
+    This uses thread-local storage to support multiple concurrent
+    LLMEngine/AsyncLLMEngine instances in the same process.
     """
-    global _current_vllm_config
-    old_vllm_config = _current_vllm_config
+    old_vllm_config = _get_current_vllm_config_attr()
     from vllm.compilation.counter import compilation_counter
     num_models_seen = compilation_counter.num_models_seen
     try:
-        _current_vllm_config = vllm_config
+        _set_current_vllm_config_attr(vllm_config)
         yield
     finally:
         logger.debug("enabled custom ops: %s",
@@ -3790,15 +3804,16 @@ def set_current_vllm_config(vllm_config: VllmConfig, check_compile=False):
                 " does not support it. Please open an issue on GitHub"
                 " if you want it to be supported.",
                 vllm_config.model_config.model)
-        _current_vllm_config = old_vllm_config
+        _set_current_vllm_config_attr(old_vllm_config)
 
 
 def get_current_vllm_config() -> VllmConfig:
-    if _current_vllm_config is None:
+    config = _get_current_vllm_config_attr()
+    if config is None:
         # in ci, usually when we test custom ops/modules directly,
         # we don't set the vllm config. In that case, we set a default
         # config.
         logger.warning("Current vLLM config is not set.")
         from vllm.config import VllmConfig
         return VllmConfig()
-    return _current_vllm_config
+    return config
